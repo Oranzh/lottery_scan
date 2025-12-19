@@ -246,7 +246,13 @@ func callGeminiOCR(fileBytes []byte, apiKey string) ([]LotteryData, error) {
 	ctx := context.Background()
 
 	client, err := genai.NewClient(ctx, &genai.ClientConfig{
-		APIKey: apiKey,
+		APIKey:  apiKey,
+		Backend: genai.BackendGeminiAPI,
+		HTTPOptions: genai.HTTPOptions{
+			// 这里替换为卖家的域名，末尾通常不需要加 /v1，SDK 会自动处理路径
+			// 如果卖家给的地址是 https://api.proxy.com/v1，尝试只填 https://api.proxy.com
+			BaseURL: "https://broad-heart-f0c3.oranzh-cc4761.workers.dev",
+		},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("创建客户端失败: %v", err)
