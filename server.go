@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,19 +12,23 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
-	"google.golang.org/genai"
+	"github.com/sashabaranov/go-openai" // ★★★ 切换为社区版 SDK ★★★
 )
 
 // ==========================================
 // CONFIG: 配置项
 // ==========================================
-const GEMINI_MODEL = "gemini-2.5-flash"
+
+// 阿里云百炼兼容接口地址
+const DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+// 模型选择 (Qwen-VL)
+const QWEN_MODEL = "qwen-vl-max"
 
 // ==========================================
-// 1. 数据结构定义 (Data Models)
+// 1. 数据结构定义 (保持不变)
 // ==========================================
 
-// 标准结构体（逻辑层使用，保持严格 String）
 type LotteryData struct {
 	Type    string       `json:"type"`
 	Issue   string       `json:"issue"`
@@ -37,14 +42,13 @@ type UserTicket struct {
 	Mode       string   `json:"mode"`
 }
 
-// ★★★ 新增：临时结构体，用于宽松解析 JSON (Middleware Struct) ★★★
-// 这里的 Red/Blue 使用 []interface{}，既能接数字，也能接字符串
+// 容错结构体
 type RawLotteryData struct {
 	Type    string `json:"type"`
 	Issue   string `json:"issue"`
 	Tickets []struct {
-		Red        []interface{} `json:"red"`  // 容错关键点
-		Blue       []interface{} `json:"blue"` // 容错关键点
+		Red        []interface{} `json:"red"`
+		Blue       []interface{} `json:"blue"`
 		Multiplier int           `json:"multiplier"`
 		Mode       string        `json:"mode"`
 	} `json:"tickets"`
@@ -70,7 +74,7 @@ type WinningNumbers struct {
 }
 
 // ==========================================
-// 2. 核心算法服务 (Brain)
+// 2. 核心算法服务 (Brain - 保持不变)
 // ==========================================
 
 func intersect(a, b []string) int {
@@ -107,7 +111,7 @@ type Verifier interface {
 	Verify(t UserTicket, win WinningNumbers) (int, int64, string)
 }
 
-// --- A. 双色球验奖器 ---
+// --- 双色球验奖器 ---
 type DoubleColorVerifier struct{}
 
 func (v *DoubleColorVerifier) Verify(t UserTicket, win WinningNumbers) (int, int64, string) {
@@ -156,7 +160,7 @@ func (v *DoubleColorVerifier) Verify(t UserTicket, win WinningNumbers) (int, int
 	return bestLevel, totalMoney, status
 }
 
-// --- B. 大乐透验奖器 ---
+// --- 大乐透验奖器 ---
 type LottoVerifier struct{}
 
 func (v *LottoVerifier) Verify(t UserTicket, win WinningNumbers) (int, int64, string) {
@@ -199,7 +203,7 @@ func (v *LottoVerifier) Verify(t UserTicket, win WinningNumbers) (int, int64, st
 	return level, money, status
 }
 
-// --- C. 排列5验奖器 ---
+// --- 排列5验奖器 ---
 type Permutation5Verifier struct{}
 
 func (v *Permutation5Verifier) Verify(t UserTicket, win WinningNumbers) (int, int64, string) {
@@ -221,19 +225,14 @@ func (v *Permutation5Verifier) Verify(t UserTicket, win WinningNumbers) (int, in
 }
 
 // ==========================================
-// 3. Gemini OCR 服务 (Eyes - 增强容错版)
+// 3. Qwen OCR 服务 (使用 sashabaranov/go-openai SDK)
 // ==========================================
 
-// ★★★ 辅助函数：将任意类型(数字或字符串)统一转为 "01" 格式的字符串 ★★★
 func anyToString(val interface{}) string {
 	switch v := val.(type) {
 	case string:
-		// 如果已经是字符串，直接返回（假设AI给了 "02"）
-		// 可以顺便处理一下去空格
 		return strings.TrimSpace(v)
 	case float64:
-		// JSON 中的数字通常解析为 float64
-		// 强制转为 int 并格式化为两位数，例如 2 -> "02", 11 -> "11"
 		return fmt.Sprintf("%02d", int(v))
 	case int:
 		return fmt.Sprintf("%02d", v)
@@ -242,23 +241,20 @@ func anyToString(val interface{}) string {
 	}
 }
 
-func callGeminiOCR(fileBytes []byte, apiKey string) ([]LotteryData, error) {
+func callQwenOCR(fileBytes []byte, apiKey string) ([]LotteryData, error) {
 	ctx := context.Background()
 
-	client, err := genai.NewClient(ctx, &genai.ClientConfig{
-		APIKey:  apiKey,
-		Backend: genai.BackendGeminiAPI,
-		HTTPOptions: genai.HTTPOptions{
-			// 这里替换为卖家的域名，末尾通常不需要加 /v1，SDK 会自动处理路径
-			// 如果卖家给的地址是 https://api.proxy.com/v1，尝试只填 https://api.proxy.com
-			BaseURL: "https://broad-heart-f0c3.oranzh-cc4761.workers.dev",
-		},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("创建客户端失败: %v", err)
-	}
+	// 1. 初始化客户端 (Sashabaranov SDK 配置方式)
+	config := openai.DefaultConfig(apiKey)
+	config.BaseURL = DASHSCOPE_BASE_URL // 切换到阿里云地址
+	client := openai.NewClientWithConfig(config)
 
-	// 提示词：依然要求返回字符串，但我们会在代码层做兜底
+	// 2. 图片编码：转换为 Base64
+	base64Str := base64.StdEncoding.EncodeToString(fileBytes)
+	mimeType := http.DetectContentType(fileBytes)
+	dataURL := fmt.Sprintf("data:%s;base64,%s", mimeType, base64Str)
+
+	// 3. 构造 Prompt
 	promptText := `
 	你是一个专业OCR助手。请分析图片，识别其中出现的**所有**彩票。
 	返回一个JSON数组（Array），每个元素代表一张票。
@@ -267,82 +263,90 @@ func callGeminiOCR(fileBytes []byte, apiKey string) ([]LotteryData, error) {
 	- issue: 期号 (例如 "2025107")
 	- tickets: 号码列表数组
 	
-	【重要】：
-	tickets 中的 "red" 和 "blue" 数组里的号码，请尽量输出为字符串(例如 "01")。
-	如果无法确定，输出数字也可以，我会自行处理。
+	【重要格式要求】：
+	1. tickets 中的 "red" 和 "blue" 数组里的号码，必须是字符串(例如 "01")。
+	2. 请保留前导零。
+	3. 请只输出纯 JSON 内容，不要包含 markdown 标记。
 	`
 
-	mimeType := http.DetectContentType(fileBytes)
-
-	parts := []*genai.Part{
-		{Text: promptText},
-		{
-			InlineData: &genai.Blob{
-				Data:     fileBytes,
-				MIMEType: mimeType,
+	// 4. 调用 Chat Completion (MultiContent 模式)
+	resp, err := client.CreateChatCompletion(
+		ctx,
+		openai.ChatCompletionRequest{
+			Model: QWEN_MODEL,
+			Messages: []openai.ChatCompletionMessage{
+				{
+					Role: openai.ChatMessageRoleUser,
+					MultiContent: []openai.ChatMessagePart{
+						{
+							Type: openai.ChatMessagePartTypeText,
+							Text: promptText,
+						},
+						{
+							Type: openai.ChatMessagePartTypeImageURL,
+							ImageURL: &openai.ChatMessageImageURL{
+								URL:    dataURL,
+								Detail: openai.ImageURLDetailHigh,
+							},
+						},
+					},
+				},
 			},
+			// 某些模型支持 JSON mode，如果报错可以注释掉下面三行
+			// ResponseFormat: &openai.ChatCompletionResponseFormat{
+			// 	Type: openai.ChatCompletionResponseFormatTypeJSONObject,
+			// },
 		},
-	}
+	)
 
-	contents := []*genai.Content{
-		{
-			Parts: parts,
-			Role:  "user",
-		},
-	}
-
-	config := &genai.GenerateContentConfig{
-		ResponseMIMEType: "application/json",
-	}
-
-	resp, err := client.Models.GenerateContent(ctx, GEMINI_MODEL, contents, config)
 	if err != nil {
-		return nil, fmt.Errorf("API调用错误: %v (MIME: %s)", err, mimeType)
+		return nil, fmt.Errorf("Qwen API调用失败: %v", err)
 	}
 
-	if len(resp.Candidates) == 0 || len(resp.Candidates[0].Content.Parts) == 0 {
-		return nil, fmt.Errorf("无识别结果")
+	if len(resp.Choices) == 0 {
+		return nil, fmt.Errorf("未返回任何结果")
 	}
 
-	jsonStr := resp.Candidates[0].Content.Parts[0].Text
+	// 5. 获取结果文本
+	jsonStr := resp.Choices[0].Message.Content
+
+	// 6. 清洗数据
 	jsonStr = strings.TrimPrefix(jsonStr, "```json")
 	jsonStr = strings.TrimPrefix(jsonStr, "```")
 	jsonStr = strings.TrimSuffix(jsonStr, "```")
 
-	// ★★★ 核心修改：使用 RawLotteryData 进行宽松解析 ★★★
-	var rawDataList []RawLotteryData
+	// 容错：提取 JSON 数组部分
+	firstOpen := strings.Index(jsonStr, "[")
+	lastClose := strings.LastIndex(jsonStr, "]")
+	if firstOpen != -1 && lastClose != -1 && lastClose > firstOpen {
+		jsonStr = jsonStr[firstOpen : lastClose+1]
+	}
 
-	// 1. 先尝试解析为数组
+	// 7. 容错解析
+	var rawDataList []RawLotteryData
 	if err := json.Unmarshal([]byte(jsonStr), &rawDataList); err != nil {
-		// 2. 如果失败，尝试解析为单个对象并包装
 		var singleRaw RawLotteryData
 		if err2 := json.Unmarshal([]byte(jsonStr), &singleRaw); err2 == nil {
 			rawDataList = []RawLotteryData{singleRaw}
 		} else {
-			fmt.Printf("JSON解析彻底失败: %v\n原始文本: %s\n", err, jsonStr)
+			fmt.Printf("JSON解析失败，原始文本: %s\n", jsonStr)
 			return nil, err
 		}
 	}
 
-	// ★★★ 3. 数据清洗与转换 (Raw -> Standard) ★★★
+	// 8. 转换为标准数据
 	var finalData []LotteryData
-
 	for _, raw := range rawDataList {
 		cleanTickets := []UserTicket{}
-
 		for _, t := range raw.Tickets {
-			// 处理红球：遍历 interface{} 数组，转为 string 数组
 			cleanRed := []string{}
 			for _, r := range t.Red {
 				cleanRed = append(cleanRed, anyToString(r))
 			}
-
-			// 处理蓝球
 			cleanBlue := []string{}
 			for _, b := range t.Blue {
 				cleanBlue = append(cleanBlue, anyToString(b))
 			}
-
 			cleanTickets = append(cleanTickets, UserTicket{
 				Red:        cleanRed,
 				Blue:       cleanBlue,
@@ -350,7 +354,6 @@ func callGeminiOCR(fileBytes []byte, apiKey string) ([]LotteryData, error) {
 				Mode:       t.Mode,
 			})
 		}
-
 		finalData = append(finalData, LotteryData{
 			Type:    raw.Type,
 			Issue:   raw.Issue,
@@ -366,21 +369,14 @@ func callGeminiOCR(fileBytes []byte, apiKey string) ([]LotteryData, error) {
 // ==========================================
 
 func getMockWinningNumber(lotteryType, issue string) WinningNumbers {
-	// 容错：去除 potential whitespace
 	issue = strings.TrimSpace(issue)
-
+	// 测试用：图片上的期号
 	if strings.Contains(lotteryType, "双色球") && issue == "2025107" {
-		// 对应你的图片期号 2025107
-		// 这里我随机填了一组中奖号码用于测试，你可以改成图片上的号码测试是否中奖
-		// 假设开奖号码就是第一行的号码: 02 11 15 21 28 33 + 07
-		return WinningNumbers{Red: []string{"02", "11", "15", "21", "28", "33"}, Blue: []string{"07"}}
+		return WinningNumbers{
+			Red:  []string{"02", "11", "15", "21", "28", "33"},
+			Blue: []string{"07"},
+		}
 	}
-
-	// 之前的 Mock 数据
-	if strings.Contains(lotteryType, "双色球") && issue == "2025145" {
-		return WinningNumbers{Red: []string{"02", "09", "15", "23", "28", "33"}, Blue: []string{"06"}}
-	}
-
 	return WinningNumbers{Red: []string{"00"}, Blue: []string{"00"}}
 }
 
@@ -396,13 +392,13 @@ func verifyHandler(c *gin.Context) {
 	}
 	fileBytes, _ := io.ReadAll(file)
 
-	apiKey := os.Getenv("GEMINI_API_KEY")
+	apiKey := os.Getenv("DASHSCOPE_API_KEY")
 	if apiKey == "" {
-		c.JSON(500, gin.H{"error": "服务端未配置 GEMINI_API_KEY"})
+		c.JSON(500, gin.H{"error": "服务端未配置 DASHSCOPE_API_KEY"})
 		return
 	}
 
-	ocrResults, err := callGeminiOCR(fileBytes, apiKey)
+	ocrResults, err := callQwenOCR(fileBytes, apiKey)
 	if err != nil {
 		c.JSON(500, gin.H{"error": "AI 识别失败: " + err.Error()})
 		return
@@ -450,8 +446,8 @@ func verifyHandler(c *gin.Context) {
 }
 
 func main() {
-	if os.Getenv("GEMINI_API_KEY") == "" {
-		log.Fatal("请先设置环境变量 GEMINI_API_KEY")
+	if os.Getenv("DASHSCOPE_API_KEY") == "" {
+		log.Println("⚠️ 警告: 未检测到 DASHSCOPE_API_KEY 环境变量，请确保已设置。")
 	}
 
 	r := gin.Default()
@@ -459,7 +455,6 @@ func main() {
 
 	r.POST("/api/v1/scan", verifyHandler)
 
-	fmt.Printf("🚀 验奖机启动 (SDK: google.golang.org/genai | Model: %s)\n", GEMINI_MODEL)
-	fmt.Println("监听端口: 8080")
+	fmt.Printf("🚀 验奖机启动 (Powered by Qwen-VL)\n- SDK: sashabaranov/go-openai\n- Model: %s\n", QWEN_MODEL)
 	r.Run(":8080")
 }
